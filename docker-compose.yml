@@ -47,8 +47,10 @@ services:
       --partitions 1 --replication-factor 1
 
   # Spark Structured Streaming job (streaming/stream_processor.py), runs in local mode.
+  # Also used to train the model:  docker compose exec spark /opt/spark/bin/spark-submit /opt/app/model/train_model.py
   spark:
-    image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
+    build: ./streaming         # official Spark 3.5.3 image + numpy for MLlib (see streaming/Dockerfile)
+    image: oil-tracker-spark
     container_name: spark
     user: root                 # avoids permission problems when writing to ./output
     depends_on:
@@ -61,6 +63,8 @@ services:
     volumes:
       - ./streaming:/opt/app/streaming
       - ./output:/opt/app/output
+      - ./data:/opt/app/data
+      - ./model:/opt/app/model
       - ivy-cache:/opt/ivy     # keeps the downloaded Kafka connector between runs
     # Connector version MUST match Spark: Spark 3.5.3 (Scala 2.12) -> spark-sql-kafka-0-10_2.12:3.5.3
     command: >

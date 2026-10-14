@@ -1,0 +1,4 @@
+model,features,r2,rmse,lofo_rmse_F160,lofo_rmse_F175,lofo_rmse_F190,lofo_rmse_F205,lofo_rmse_F220,lofo_rmse_mean
+linear,hour + temperature,0.8514,3.42,5.122,4.414,0.757,2.44,6.593,3.865
+interaction,hour + temperature + hour_x_temp,0.9813,1.213,3.052,2.356,0.757,1.016,2.185,1.873
+quadratic,hour + temperature + hour_x_temp + hour_sq,0.9822,1.185,3.043,2.371,0.757,0.977,2.144,1.858
