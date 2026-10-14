@@ -4,7 +4,8 @@ __pycache__/
 .venv/
 venv/
 
-# Spark (added in later steps): checkpoints and temp output
+# Spark: generated output, checkpoints and temp files
+output/
 checkpoints/
 spark-warehouse/
 metastore_db/

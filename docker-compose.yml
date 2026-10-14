@@ -45,3 +45,30 @@ services:
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092
       --create --if-not-exists --topic oil-readings
       --partitions 1 --replication-factor 1
+
+  # Spark Structured Streaming job (streaming/stream_processor.py), runs in local mode.
+  spark:
+    image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
+    container_name: spark
+    user: root                 # avoids permission problems when writing to ./output
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "4040:4040"            # Spark web UI -> http://localhost:4040 (Structured Streaming tab)
+    environment:
+      PYTHONUNBUFFERED: "1"    # show print() output in the logs immediately
+    volumes:
+      - ./streaming:/opt/app/streaming
+      - ./output:/opt/app/output
+      - ivy-cache:/opt/ivy     # keeps the downloaded Kafka connector between runs
+    # Connector version MUST match Spark: Spark 3.5.3 (Scala 2.12) -> spark-sql-kafka-0-10_2.12:3.5.3
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[2]
+      --conf spark.jars.ivy=/opt/ivy
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+      /opt/app/streaming/stream_processor.py
+
+volumes:
+  ivy-cache:
