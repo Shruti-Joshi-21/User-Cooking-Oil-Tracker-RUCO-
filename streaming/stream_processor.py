@@ -4,15 +4,15 @@ Steps 3 + 5: Spark Structured Streaming job.
 Kafka `oil-readings` -> parse JSON -> clean (fill missing values, remove z-score outliers)
 -> rolling average TPC per fryer -> status + discard alerts
 -> hours left until discard (model rate as prior, fryer's own live slope once available)
--> CSV files in output/ (read by the Streamlit dashboard).
+-> PostgreSQL tables `readings` and `alerts` (read by the Streamlit dashboard).
 
 Spark reads Kafka in micro-batches (every TRIGGER seconds). For each micro-batch we
 add the last few clean readings of every fryer ("history"), so the z-score and the
 rolling average can look back across batch boundaries.
 """
-import csv
-import os
 import shutil
+import time
+from datetime import datetime
 
 from pyspark.ml.regression import LinearRegressionModel
 from pyspark.sql import SparkSession, Window
@@ -22,10 +22,11 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, 
 # ---------------- Config ----------------
 KAFKA_SERVER = "kafka:29092"        # Kafka's address inside the Docker network
 TOPIC = "oil-readings"
-OUTPUT_DIR = "/opt/app/output"      # mounted to oil-tracker/output on Windows
-CLEAN_CSV = os.path.join(OUTPUT_DIR, "clean_readings.csv")
-ALERTS_CSV = os.path.join(OUTPUT_DIR, "alerts.csv")
 CHECKPOINT_DIR = "/tmp/oil-checkpoint"
+
+# PostgreSQL (the `postgres` container). Spark writes with JDBC: df.write.jdbc(...)
+JDBC_URL = "jdbc:postgresql://postgres:5432/oiltracker"
+JDBC_PROPS = {"user": "oil", "password": "oil123", "driver": "org.postgresql.Driver"}
 TRIGGER = "2 seconds"               # micro-batch interval
 
 # Outlier settings were tuned by simulation: a longer history or smaller std floor made the
@@ -62,14 +63,18 @@ SCHEMA = StructType([
 ])
 HISTORY_SCHEMA = "fryer_id string, data_hour double, tpc double, acid_value double, carbonyl_value double"
 
-CLEAN_HEADER = ["timestamp", "fryer_id", "fryer_name", "temperature", "data_hour",
-                "tpc_raw", "tpc_clean", "tpc_rolling", "acid_value", "carbonyl_value",
-                "z_score", "is_outlier", "was_missing", "status",
-                "live_slope", "rate_per_hour", "rate_source", "hours_left",
-                "predicted_discard_hour", "extrapolated"]
-ALERT_HEADER = ["timestamp", "fryer_id", "fryer_name", "data_hour", "tpc_rolling", "message"]
+# Column layout of the database tables (see database/init.sql); `id` is filled by PostgreSQL
+READINGS_SCHEMA = ("run_id long, ts timestamp, fryer_id string, fryer_name string, temperature int, "
+                   "data_hour double, tpc_raw double, tpc_clean double, tpc_rolling double, "
+                   "acid_value double, carbonyl_value double, z_score double, is_outlier boolean, "
+                   "was_missing boolean, status string, live_slope double, rate_per_hour double, "
+                   "rate_source string, hours_left double, predicted_discard_hour double, "
+                   "extrapolated boolean")
+ALERTS_SCHEMA = ("run_id long, ts timestamp, fryer_id string, fryer_name string, "
+                 "data_hour double, tpc_rolling double, message string")
 
 # ---------------- State kept between micro-batches (driver memory) ----------------
+RUN_ID = int(time.time())   # identifies this Spark run in the database (start time, epoch seconds)
 history = {}      # fryer_id -> list of recent clean readings (data_hour, tpc, acid, carbonyl)
 alerted = set()   # fryers already alerted in the current oil cycle (alert only once)
 slope_sums = {}   # fryer_id -> running sums of clean readings this oil cycle (for the live slope)
@@ -98,14 +103,11 @@ def choose_rate(fryer_id, temperature):
     return live, model_rate, "model"
 
 
-def append_csv(path, header, rows):
-    """Append rows to a CSV file, writing the header the first time."""
-    is_new = not os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.writer(f)
-        if is_new:
-            writer.writerow(header)
-        writer.writerows(rows)
+def write_to_db(spark, rows, schema, table):
+    """Append rows to a PostgreSQL table using Spark's JDBC writer."""
+    if rows:
+        spark.createDataFrame(rows, schema).write.jdbc(JDBC_URL, table, mode="append",
+                                                       properties=JDBC_PROPS)
 
 
 def process_batch(batch_df, batch_id):
@@ -206,8 +208,9 @@ def process_batch(batch_df, batch_id):
             hours_left = max((TPC_LIMIT - r.tpc_rolling) / rate, 0.0)
             predicted = r.data_hour + hours_left
         extrapolated = predicted is not None and predicted > MAX_LAB_HOUR
+        ts = datetime.fromisoformat(r.timestamp)       # ISO text from the producer -> timestamp
 
-        clean_out.append([r.timestamp, r.fryer_id, r.fryer_name, r.temperature, r.data_hour,
+        clean_out.append([RUN_ID, ts, r.fryer_id, r.fryer_name, r.temperature, r.data_hour,
                           r.tpc, r.tpc_clean, round(r.tpc_rolling, 2) if r.tpc_rolling else None,
                           r.acid_clean, r.carbonyl_clean,
                           round(r.z_score, 2) if r.z_score is not None else None,
@@ -222,7 +225,7 @@ def process_batch(batch_df, batch_id):
             alerted.add(r.fryer_id)
             msg = (f"{r.fryer_name}: avg TPC {r.tpc_rolling:.1f}% >= {TPC_LIMIT}% FSSAI limit "
                    f"at hour {r.data_hour}. Discard oil and send to RUCO collection.")
-            alert_out.append([r.timestamp, r.fryer_id, r.fryer_name, r.data_hour,
+            alert_out.append([RUN_ID, ts, r.fryer_id, r.fryer_name, r.data_hour,
                               round(r.tpc_rolling, 2), msg])
             print(f"*** ALERT *** {msg}")
 
@@ -230,9 +233,9 @@ def process_batch(batch_df, batch_id):
         fryer_hist.append((r.data_hour, r.tpc_clean, r.acid_clean, r.carbonyl_clean))
         del fryer_hist[:-HISTORY_N]                     # keep only the last HISTORY_N
 
-    append_csv(CLEAN_CSV, CLEAN_HEADER, clean_out)
-    if alert_out:
-        append_csv(ALERTS_CSV, ALERT_HEADER, alert_out)
+    # 8) Save to PostgreSQL
+    write_to_db(spark, clean_out, READINGS_SCHEMA, "readings")
+    write_to_db(spark, alert_out, ALERTS_SCHEMA, "alerts")
 
     n_out = sum(r.is_outlier for r in rows)
     n_miss = sum(r.was_missing for r in rows)
@@ -243,12 +246,10 @@ def process_batch(batch_df, batch_id):
 
 
 def main():
-    # Every run starts fresh: old checkpoint and output files are removed.
+    # Every run starts fresh: the old checkpoint is removed and rows get a new run_id.
+    # (Older runs stay in the database, so they can still be queried with SQL.)
     shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    for path in (CLEAN_CSV, ALERTS_CSV):
-        if os.path.exists(path):
-            os.remove(path)
+    print(f"Run id: {RUN_ID}", flush=True)
 
     spark = (SparkSession.builder
              .appName("ruco-oil-tracker")
@@ -260,7 +261,8 @@ def main():
     # Degradation rate at temperature T = d(tpc)/d(hour) = b_hour + b_int * T
     global B_HOUR, B_INT
     model = LinearRegressionModel.load(MODEL_PATH)
-    B_HOUR, _, B_INT = model.coefficients.toArray()
+    b_hour, _, b_int = model.coefficients.toArray()
+    B_HOUR, B_INT = float(b_hour), float(b_int)     # numpy -> plain Python floats (for the DB rows)
     print(f"Loaded model: rate(T) = {B_HOUR:.4f} + {B_INT:.6f} * T  (% TPC per hour)", flush=True)
 
     # Read the Kafka topic as an unbounded streaming DataFrame

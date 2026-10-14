@@ -1,7 +1,7 @@
 """
 Step 6: Streamlit dashboard for the RUCO oil tracker (visual version).
 
-Reads the CSV files written by the Spark job (output/clean_readings.csv, output/alerts.csv)
+Reads the PostgreSQL tables written by the Spark job (readings, alerts, alert_impact view)
 and refreshes every 2 seconds:
   - KPI tiles            : fryers to discard, alerts, oil to RUCO, biodiesel, CO2 avoided
   - TPC gauges           : one per fryer, green / amber / red bands at 22% and 25%
@@ -13,28 +13,28 @@ and refreshes every 2 seconds:
 Run:  py -m streamlit run dashboard/app.py
 """
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import create_engine, text
 
-OUTPUT = Path(__file__).parent.parent / "output"
-CLEAN_CSV = OUTPUT / "clean_readings.csv"
-ALERTS_CSV = OUTPUT / "alerts.csv"
+# PostgreSQL container from docker-compose.yml (port 5433 on Windows)
+DB_URL = "postgresql+psycopg2://oil:oil123@localhost:5433/oiltracker"
 REFRESH_SECONDS = 2
 STEP_HOURS = 0.1           # one reading = 0.1 frying hour (see producer.py)
 
 TPC_LIMIT = 25.0
 TPC_WARNING = 22.0
 
-# Fryers in fixed order, each with a fixed colour (same in every chart) and its oil volume
+# Fryers in fixed order, each with a fixed colour (same in every chart).
+# Oil volumes and the ESG factors live in the database (fryers table, alert_impact view).
 FRYERS = {
-    "F160": {"name": "Bakery",          "litres": 10, "color": "#2a78d6"},
-    "F175": {"name": "Cafe",            "litres": 8,  "color": "#eb6834"},
-    "F190": {"name": "College Canteen", "litres": 25, "color": "#1baf7a"},
-    "F205": {"name": "Restaurant",      "litres": 20, "color": "#eda100"},
-    "F220": {"name": "Street Stall",    "litres": 15, "color": "#e87ba4"},
+    "F160": {"name": "Bakery",          "color": "#2a78d6"},
+    "F175": {"name": "Cafe",            "color": "#eb6834"},
+    "F190": {"name": "College Canteen", "color": "#1baf7a"},
+    "F205": {"name": "Restaurant",      "color": "#eda100"},
+    "F220": {"name": "Street Stall",    "color": "#e87ba4"},
 }
 FRYER_COLOR = {f["name"]: f["color"] for f in FRYERS.values()}
 
@@ -64,23 +64,30 @@ def chart_heading(icon, text):
     """Heading above a chart, with a Material icon (Plotly titles can't render icon fonts)."""
     st.markdown(f"##### :material/{icon}: {text}")
 
-BIODIESEL_YIELD = 0.85     # litres of biodiesel per litre of used cooking oil (assumption)
-CO2_PER_L_BIODIESEL = 2.2  # kg CO2 avoided per litre of biodiesel replacing diesel (assumption)
-
 PLOT_CONFIG = {"displayModeBar": False}
 
 st.set_page_config(page_title="RUCO Oil Tracker", page_icon=":material/oil_barrel:", layout="wide")
 
 
 # ---------------------------------------------------------------- data helpers
-def read_csv(path):
-    """Read a CSV that Spark may be appending to right now (skip a half-written last line)."""
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path, on_bad_lines="skip")
-    except (pd.errors.EmptyDataError, PermissionError):
-        return pd.DataFrame()
+@st.cache_resource
+def get_engine():
+    """One database connection pool for the whole app."""
+    return create_engine(DB_URL, pool_pre_ping=True)
+
+
+def load_data():
+    """Latest Spark run's readings and alerts (with ESG impact), plus each fryer's oil volume."""
+    with get_engine().connect() as conn:
+        litres = dict(conn.execute(text("SELECT fryer_id, oil_litres FROM fryers")).all())
+        run_id = conn.execute(text("SELECT MAX(run_id) FROM readings")).scalar()
+        if run_id is None:
+            return pd.DataFrame(), pd.DataFrame(), litres
+        readings = pd.read_sql(text("SELECT * FROM readings WHERE run_id = :r ORDER BY id"),
+                               conn, params={"r": run_id})
+        alerts = pd.read_sql(text("SELECT * FROM alert_impact WHERE run_id = :r ORDER BY ts"),
+                             conn, params={"r": run_id})
+    return readings, alerts, litres
 
 
 def current_cycle(df):
@@ -200,10 +207,11 @@ def trend_chart(cycle, column, y_title, show_limits=False, show_raw=False, heigh
 def esg_by_fryer_chart(alerts):
     """Bars: litres of used oil sent to RUCO per fryer (each alert = one full fryer of oil)."""
     names = [f["name"] for f in FRYERS.values()]
-    litres = [FRYERS[fid]["litres"] * int((alerts.get("fryer_id", pd.Series(dtype=str)) == fid).sum())
-              for fid in FRYERS]
+    per_fryer = (alerts.groupby("fryer_id")["oil_litres"].sum() if not alerts.empty
+                 else pd.Series(dtype=float))
+    litres = [float(per_fryer.get(fid, 0)) for fid in FRYERS]
     fig = go.Figure(go.Bar(x=names, y=litres, marker_color=[FRYER_COLOR[n] for n in names],
-                           text=[f"{v} L" if v else "" for v in litres], textposition="outside",
+                           text=[f"{v:.0f} L" if v else "" for v in litres], textposition="outside",
                            cliponaxis=False, hovertemplate="%{x}: %{y} L<extra></extra>"))
     fig.update_yaxes(title="Litres of used oil", range=[0, max(max(litres) * 1.25, 10)])
     return base_layout(fig, 300)
@@ -211,12 +219,9 @@ def esg_by_fryer_chart(alerts):
 
 def esg_cumulative_chart(alerts):
     """Step line: biodiesel potential growing with every discard alert."""
-    df = alerts.copy()
-    df["time"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("time")
-    df["biodiesel"] = (df["fryer_id"].map(lambda f: FRYERS[f]["litres"]) * BIODIESEL_YIELD).cumsum()
+    df = alerts.sort_values("ts")
     fig = go.Figure(go.Scatter(
-        x=df["time"], y=df["biodiesel"], mode="lines+markers", line_shape="hv",
+        x=df["ts"], y=df["biodiesel_litres"].cumsum(), mode="lines+markers", line_shape="hv",
         line=dict(color="#2e7d5b", width=2.5), marker=dict(size=9),
         fill="tozeroy", fillcolor="rgba(46,125,91,0.12)",
         text=df["fryer_name"], hovertemplate="%{text} discarded<br>total %{y:.1f} L biodiesel<extra></extra>"))
@@ -249,34 +254,37 @@ st.caption(":material/stream: Live oil quality per fryer · Kafka → Spark Stru
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def live_view():
-    readings = read_csv(CLEAN_CSV)
-    alerts = read_csv(ALERTS_CSV)
+    try:
+        readings, alerts, litres_by_fryer = load_data()
+    except Exception as e:
+        st.error("Cannot reach the PostgreSQL database on localhost:5433. "
+                 "Start it with `docker compose up -d`.", icon=":material/database:")
+        st.caption(f"{type(e).__name__}: {str(e).splitlines()[0]}")
+        return
     if readings.empty:
         st.info("Waiting for data… start Spark (`docker compose up -d`) and the producer "
-                "(`py producer/producer.py`).")
+                "(`py producer/producer.py`).", icon=":material/hourglass_top:")
         return
 
     cycle = current_cycle(readings)
     latest = (cycle.groupby("fryer_id").tail(1).set_index("fryer_id")
               .reindex(list(FRYERS)).dropna(subset=["fryer_name"]).reset_index())
 
-    last_ts = pd.to_datetime(readings["timestamp"].iloc[-1])
-    age = (datetime.now(timezone.utc) - last_ts).total_seconds()
+    age = (datetime.now(timezone.utc) - readings["ts"].iloc[-1]).total_seconds()
     st.caption(f":material/sync: Updates every {REFRESH_SECONDS} s · last reading {age:.0f} s ago · "
-               f"{len(readings)} readings processed")
+               f"{len(readings)} readings in PostgreSQL for this run")
 
-    # ---- KPI tiles ----
-    litres = sum(FRYERS[f]["litres"] for f in alerts.get("fryer_id", []))
-    biodiesel = litres * BIODIESEL_YIELD
+    # ---- KPI tiles (ESG numbers come from the alert_impact view in the database) ----
     k = st.columns(5)
     k[0].metric("Fryers to discard now", int((latest["status"] == "DISCARD").sum()),
                 icon=":material/dangerous:", border=True)
     k[1].metric("Discard alerts raised", len(alerts),
                 icon=":material/notifications_active:", border=True)
-    k[2].metric("Oil sent to RUCO", f"{litres} L", icon=":material/recycling:", border=True)
-    k[3].metric("Biodiesel potential", f"{biodiesel:.1f} L",
+    k[2].metric("Oil sent to RUCO", f"{alerts['oil_litres'].sum():.0f} L",
+                icon=":material/recycling:", border=True)
+    k[3].metric("Biodiesel potential", f"{alerts['biodiesel_litres'].sum():.1f} L",
                 icon=":material/local_gas_station:", border=True)
-    k[4].metric("CO₂ avoided", f"{biodiesel * CO2_PER_L_BIODIESEL:.1f} kg",
+    k[4].metric("CO₂ avoided", f"{alerts['co2_avoided_kg'].sum():.1f} kg",
                 icon=":material/eco:", border=True)
 
     # ---- Gauges ----
@@ -286,7 +294,7 @@ def live_view():
         with col:
             st.markdown(f"**{row.fryer_name}**  \n:gray[:material/device_thermostat: "
                         f"{row.temperature} °C · :material/water_drop: "
-                        f"{FRYERS[row.fryer_id]['litres']} L]", text_alignment="center")
+                        f"{litres_by_fryer[row.fryer_id]:.0f} L]", text_alignment="center")
             st.plotly_chart(gauge(row), width="stretch", config=PLOT_CONFIG,
                             key=f"gauge_{row.fryer_id}")
             source = "live slope" if row.rate_source == "live" else "model prior"
@@ -360,7 +368,8 @@ st.toggle("Show raw sensor readings on the TPC chart (red × = outlier removed b
           key="show_raw")
 live_view()
 
-st.caption(f"ESG assumptions: oil volume per fryer as shown on each gauge; 1 L used oil → "
-           f"{BIODIESEL_YIELD} L biodiesel; {CO2_PER_L_BIODIESEL} kg CO₂ avoided per L biodiesel "
-           f"(diesel ≈ 2.68 kg CO₂/L, UCO biodiesel cuts lifecycle emissions by ~80%). "
-           f"Acid and carbonyl values are shown as measured (only TPC is used for alerts).")
+st.caption(":material/database: Data source: PostgreSQL (`readings`, `alerts`, `alert_impact` view). "
+           "ESG assumptions (defined in database/init.sql): oil volume per fryer as shown on each "
+           "gauge; 1 L used oil → 0.85 L biodiesel; 2.2 kg CO₂ avoided per L biodiesel "
+           "(diesel ≈ 2.68 kg CO₂/L, UCO biodiesel cuts lifecycle emissions by ~80%). "
+           "Acid and carbonyl values are shown as measured (only TPC is used for alerts).")
