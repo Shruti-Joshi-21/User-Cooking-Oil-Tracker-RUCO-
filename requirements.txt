@@ -1,3 +1,6 @@
 pandas
 numpy
 kafka-python>=2.0.3
+streamlit>=1.40
+plotly
+matplotlib
