@@ -1,0 +1,3 @@
+pandas
+numpy
+kafka-python>=2.0.3
