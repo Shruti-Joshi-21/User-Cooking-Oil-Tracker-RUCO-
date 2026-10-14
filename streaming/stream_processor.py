@@ -1,9 +1,10 @@
 """
-Step 3: Spark Structured Streaming job.
+Steps 3 + 5: Spark Structured Streaming job.
 
 Kafka `oil-readings` -> parse JSON -> clean (fill missing values, remove z-score outliers)
--> rolling average TPC per fryer -> status + discard alerts -> CSV files in output/
-(the Streamlit dashboard will read these files in a later step).
+-> rolling average TPC per fryer -> status + discard alerts
+-> hours left until discard (model rate as prior, fryer's own live slope once available)
+-> CSV files in output/ (read by the Streamlit dashboard).
 
 Spark reads Kafka in micro-batches (every TRIGGER seconds). For each micro-batch we
 add the last few clean readings of every fryer ("history"), so the z-score and the
@@ -13,6 +14,7 @@ import csv
 import os
 import shutil
 
+from pyspark.ml.regression import LinearRegressionModel
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
@@ -36,6 +38,17 @@ ROLLING_N = 10       # rolling average over the last 10 readings (= 1 data-hour)
 TPC_WARNING = 22.0   # early warning level
 TPC_LIMIT = 25.0     # FSSAI limit: oil must be discarded
 
+# Hours-to-discard (Step 5)
+MODEL_PATH = "/opt/app/model/tpc_model"   # saved by model/train_model.py
+MIN_LIVE_HOURS = 3.0   # use the fryer's own slope once it has >= 3 data-hours of clean readings
+# Asymmetric guard on the live slope (tuned by replaying the stream):
+#  - faster than the model (up to 3x) is accepted: it means "discard sooner" = the safe direction
+#  - slower than the model is only accepted down to 0.7x: early readings fall in the oil's slow
+#    "induction period", and trusting that low slope over-estimated hours left by up to 22 h
+MAX_RATE_RATIO = 3.0
+MIN_RATE_RATIO = 0.7
+MAX_LAB_HOUR = 30      # predictions past hour 30 are beyond the lab data
+
 # Shape of the JSON messages sent by producer.py
 SCHEMA = StructType([
     StructField("fryer_id", StringType()),
@@ -51,12 +64,38 @@ HISTORY_SCHEMA = "fryer_id string, data_hour double, tpc double, acid_value doub
 
 CLEAN_HEADER = ["timestamp", "fryer_id", "fryer_name", "temperature", "data_hour",
                 "tpc_raw", "tpc_clean", "tpc_rolling", "acid_value", "carbonyl_value",
-                "z_score", "is_outlier", "was_missing", "status"]
+                "z_score", "is_outlier", "was_missing", "status",
+                "live_slope", "rate_per_hour", "rate_source", "hours_left",
+                "predicted_discard_hour", "extrapolated"]
 ALERT_HEADER = ["timestamp", "fryer_id", "fryer_name", "data_hour", "tpc_rolling", "message"]
 
 # ---------------- State kept between micro-batches (driver memory) ----------------
 history = {}      # fryer_id -> list of recent clean readings (data_hour, tpc, acid, carbonyl)
 alerted = set()   # fryers already alerted in the current oil cycle (alert only once)
+slope_sums = {}   # fryer_id -> running sums of clean readings this oil cycle (for the live slope)
+B_HOUR = B_INT = None   # model coefficients, loaded in main(): rate(T) = B_HOUR + B_INT * T
+
+
+def choose_rate(fryer_id, temperature):
+    """Return (live_slope, rate_used, rate_source) for one fryer."""
+    model_rate = B_HOUR + B_INT * temperature        # model prior (% TPC per hour)
+
+    # Least-squares slope from plain sums: slope = cov(hour, tpc) / var(hour)
+    #   = (n*Σht - Σh*Σt) / (n*Σh² - (Σh)²)
+    live = None
+    s = slope_sums.get(fryer_id)
+    if s and s["n"] >= 2:
+        var = s["n"] * s["shh"] - s["sh"] ** 2
+        if var > 0:
+            live = (s["n"] * s["sht"] - s["sh"] * s["st"]) / var
+
+    enough_data = s is not None and s["last_h"] - s["first_h"] >= MIN_LIVE_HOURS
+    # Guard: zero/negative slopes, or slopes too far from the model, fall back to the model rate
+    sane = (live is not None and live > 0
+            and model_rate * MIN_RATE_RATIO <= live <= model_rate * MAX_RATE_RATIO)
+    if enough_data and sane:
+        return live, live, "live"
+    return live, model_rate, "model"
 
 
 def append_csv(path, header, rows):
@@ -83,6 +122,7 @@ def process_batch(batch_df, batch_id):
             print(f"[oil change] {row.fryer_id}: fresh oil, history reset")
             history.pop(row.fryer_id)
             alerted.discard(row.fryer_id)
+            slope_sums.pop(row.fryer_id, None)
 
     # 2) Combine new readings with each fryer's recent clean history
     hist_rows = [(fid, *r) for fid, rows in history.items() for r in rows]
@@ -132,18 +172,51 @@ def process_batch(batch_df, batch_id):
                     .otherwise("OK"))
     )
 
-    rows = (df.filter("is_new")                       # history rows were only for context
-              .orderBy("fryer_id", "data_hour")
-              .collect())
+    new = df.filter("is_new")                         # history rows were only for context
 
-    # 6) Save clean readings, raise alerts, update history
-    clean_out, alert_out = [], []
+    # 6) Live slope: add this batch's sums of CLEAN measured readings to the running totals.
+    #    tpc_valid excludes outliers and missing values, so one spike can't wreck the slope.
+    batch_sums = (new.filter(F.col("tpc_valid").isNotNull())
+                     .groupBy("fryer_id")
+                     .agg(F.count("*").alias("n"),
+                          F.sum("data_hour").alias("sh"),
+                          F.sum("tpc_valid").alias("st"),
+                          F.sum(F.col("data_hour") * F.col("tpc_valid")).alias("sht"),
+                          F.sum(F.col("data_hour") * F.col("data_hour")).alias("shh"),
+                          F.min("data_hour").alias("first_h"),
+                          F.max("data_hour").alias("last_h"))
+                     .collect())
+    for b in batch_sums:
+        s = slope_sums.setdefault(b.fryer_id, {"n": 0, "sh": 0.0, "st": 0.0, "sht": 0.0,
+                                               "shh": 0.0, "first_h": b.first_h})
+        for k in ("n", "sh", "st", "sht", "shh"):
+            s[k] += b[k]
+        s["last_h"] = b.last_h
+
+    rows = new.orderBy("fryer_id", "data_hour").collect()
+    rates = {r.fryer_id: choose_rate(r.fryer_id, r.temperature) for r in rows}
+
+    # 7) Save clean readings + hours left, raise alerts, update history
+    clean_out, alert_out, summary = [], [], {}
     for r in rows:
+        live, rate, source = rates[r.fryer_id]
+        hours_left = predicted = None
+        if r.tpc_rolling is not None:
+            # hours left = how far below the limit we are / how fast TPC is rising
+            hours_left = max((TPC_LIMIT - r.tpc_rolling) / rate, 0.0)
+            predicted = r.data_hour + hours_left
+        extrapolated = predicted is not None and predicted > MAX_LAB_HOUR
+
         clean_out.append([r.timestamp, r.fryer_id, r.fryer_name, r.temperature, r.data_hour,
                           r.tpc, r.tpc_clean, round(r.tpc_rolling, 2) if r.tpc_rolling else None,
                           r.acid_clean, r.carbonyl_clean,
                           round(r.z_score, 2) if r.z_score is not None else None,
-                          r.is_outlier, r.was_missing, r.status])
+                          r.is_outlier, r.was_missing, r.status,
+                          round(live, 4) if live is not None else None, round(rate, 4), source,
+                          round(hours_left, 2) if hours_left is not None else None,
+                          round(predicted, 2) if predicted is not None else None, extrapolated])
+        if hours_left is not None:
+            summary[r.fryer_id] = f"{hours_left:.1f}h ({source}{', extrap' if extrapolated else ''})"
 
         if r.status == "DISCARD" and r.fryer_id not in alerted:
             alerted.add(r.fryer_id)
@@ -166,6 +239,7 @@ def process_batch(batch_df, batch_id):
     latest = {r.fryer_id: f"{r.tpc_rolling:.1f}" for r in rows if r.tpc_rolling}
     print(f"batch {batch_id}: {len(rows)} readings | outliers removed: {n_out} | "
           f"missing filled: {n_miss} | rolling TPC: {latest}")
+    print(f"           hours left: {summary}")
 
 
 def main():
@@ -181,6 +255,13 @@ def main():
              .config("spark.sql.shuffle.partitions", "1")   # tiny data -> 1 partition is fastest
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
+
+    # Load the MLlib model trained in Step 4 (features: hour, temperature, hour_x_temp).
+    # Degradation rate at temperature T = d(tpc)/d(hour) = b_hour + b_int * T
+    global B_HOUR, B_INT
+    model = LinearRegressionModel.load(MODEL_PATH)
+    B_HOUR, _, B_INT = model.coefficients.toArray()
+    print(f"Loaded model: rate(T) = {B_HOUR:.4f} + {B_INT:.6f} * T  (% TPC per hour)", flush=True)
 
     # Read the Kafka topic as an unbounded streaming DataFrame
     raw = (spark.readStream.format("kafka")
